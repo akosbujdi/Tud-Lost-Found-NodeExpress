@@ -1,38 +1,39 @@
 const path = require('path');
 const multer = require('multer');
-const {MongoClient} = require("mongodb");
+const {connectDB} = require("../lib/mongodb");
+const multerS3 = require("multer-s3");
+const {S3Client, GetObjectCommand} = require("@aws-sdk/client-s3");
+const  dotenv = require("dotenv");
+const {getSignedUrl} = require("@aws-sdk/s3-request-presigner")
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, path.join(__dirname, '..', 'images'));
+dotenv.config();
+
+const s3 = new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-    }
-});
+})
 
-const upload = multer({storage});
-
-const mongoURI = process.env.MONGODB_URI;
-let client;
-let db;
-MongoClient.connect(mongoURI)
-    .then((connectedClient) => {
-        client = connectedClient;
-        db = client.db('TUD-LOST-FOUND');
-        console.log('Connected to MongoDB');
-    })
-    .catch(err => {
-        console.error('Error connecting to MongoDB:', err);
-    });
+const upload = multer({
+    storage: multerS3({
+        s3: s3,
+        bucket: process.env.S3_BUCKET_NAME,
+        key: (req,file,cb) => {
+            const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+            const fileName = `uploads/${file.fieldname}-${uniqueSuffix}${path.extname(file.originalname)}`;
+            cb(null,fileName);
+        },
+        contentType: multerS3.AUTO_CONTENT_TYPE,
+    }),
+    limits: {fileSize: 5*1024*1024},
+})
 
 // Add lost item
 const addLostItem = async (req, res) => {
     const {name, category, description, location, dateLost, email} = req.body;
-    const image = req.file;
-
-    const imagePath = image ? path.join('images', image.filename) : null;
+    const image = req.file ? req.file.key : null;
 
     const lostItem = {
         name,
@@ -41,19 +42,20 @@ const addLostItem = async (req, res) => {
         location,
         dateLost,
         email,
-        image: imagePath,
+        image,
         createdAt: new Date(),
     };
 
     try {
+        const db = await connectDB();
         const collection = db.collection('lost_items');
-        const result = await collection.insertOne(lostItem);
 
+        const result = await collection.insertOne(lostItem);
         console.log('Data inserted successfully:', result);
 
         res.json({
             success: true,
-            message: 'Data received successfully from backend!',
+            message: 'Data uploaded and stored successfully!',
             receivedData: {
                 name,
                 category,
@@ -62,7 +64,7 @@ const addLostItem = async (req, res) => {
                 dateLost,
                 email,
             },
-            image: image ? image.originalname : 'No image',
+            image: image || "No Image"
         });
     } catch (error) {
         console.error('Error inserting document into MongoDB:', error);
@@ -75,26 +77,31 @@ const addLostItem = async (req, res) => {
 
 const getLostItems = async (req, res) => {
     try {
-        const collection = db.collection('lost_items');
+        const db = await connectDB();
+        const collection = db.collection("lost_items");
         const items = await collection.find().toArray();
 
-        const baseUrl = `${req.protocol}://${req.get('host')}`; // e.g., http://localhost:3000
-        const itemsWithFullImagePath = items.map(item => ({
-            ...item,
-            image: `${baseUrl}/${item.image}` // Prepend base URL to image path
-        }));
+        for (let item of items) {
+            if (item.image) {
+                const command = new GetObjectCommand({
+                    Bucket: process.env.S3_BUCKET_NAME,
+                    Key: item.image,
+                });
+                item.image = await getSignedUrl(s3, command, {expiresIn: 3600})
+            }
+        }
 
-        console.log('Fetched lost items:', itemsWithFullImagePath);
+        console.log("Fetched lost items:", items);
 
         res.json({
             success: true,
-            items: itemsWithFullImagePath
+            items,
         });
     } catch (err) {
-        console.error('Error fetching lost items:', err);
+        console.error("Error fetching lost items:",err)
         res.status(500).json({
-            success: false,
-            message: 'Error fetching lost items'
+            success:false,
+            message: "Error fetching lost items",
         });
     }
 };
